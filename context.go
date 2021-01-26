@@ -43,6 +43,8 @@ type Context struct {
 	cache        TileCache
 
 	overrideAttribution *string
+
+	result RenderResult
 }
 
 // NewContext creates a new instance of Context
@@ -259,9 +261,10 @@ func (m *Context) determineZoom(bounds s2.Rect, center s2.LatLng) int {
 	}
 
 	tileSize := m.tileProvider.TileSize
-	marginL, marginT, marginR, marginB := m.determineExtraMarginPixels()
-	w := (float64(m.width) - 2.0*math.Max(marginL, marginR)) / float64(tileSize)
-	h := (float64(m.height) - 2.0*math.Max(marginT, marginB)) / float64(tileSize)
+	margin := 0.0
+	w := (float64(m.width) - 2.0*margin) / float64(tileSize)
+	h := (float64(m.height) - 2.0*margin) / float64(tileSize)
+
 	minX := (b.Lo().Lng.Degrees() + 180.0) / 360.0
 	maxX := (b.Hi().Lng.Degrees() + 180.0) / 360.0
 	minY := (1.0 - math.Log(math.Tan(b.Lo().Lat.Radians())+(1.0/math.Cos(b.Lo().Lat.Radians())))/math.Pi) / 2.0
@@ -428,12 +431,36 @@ func (m *Context) Render() (image.Image, error) {
 		return nil, err
 	}
 
+	return m.renderWithZoomAndCenter(zoom, center)
+}
+
+func (m *Context) renderWithZoomAndCenter(zoom int, center s2.LatLng) (image.Image, error) {
+	m.result = RenderResult{
+		Zoom:   zoom,
+		Center: center,
+	}
+
 	tileSize := m.tileProvider.TileSize
 	trans := newTransformer(m.width, m.height, zoom, center, tileSize)
 	img := image.NewRGBA(image.Rect(0, 0, trans.pWidth, trans.pHeight))
 	gc := gg.NewContextForRGBA(img)
 	if m.background != nil {
 		draw.Draw(img, img.Bounds(), &image.Uniform{m.background}, image.Point{}, draw.Src)
+	}
+
+	bounds := m.determineBounds()
+	leftX, bottomY := trans.LatLngToXY(bounds.Lo())
+	rightX, topY := trans.LatLngToXY(bounds.Hi())
+
+	left, top, right, bottom := m.getBoundaryMargins()
+
+	if !bounds.IsEmpty() && zoom > 0 {
+		widthWithMargins := (rightX + right) - (leftX - left)
+		heightWithMargins := (bottomY + bottom) - (topY - top)
+
+		if widthWithMargins > float64(m.width) || heightWithMargins > float64(m.height) {
+			return m.renderWithZoomAndCenter(zoom-1, center)
+		}
 	}
 
 	// fetch and draw tiles to img
@@ -455,8 +482,20 @@ func (m *Context) Render() (image.Image, error) {
 
 	// crop image
 	croppedImg := image.NewRGBA(image.Rect(0, 0, int(m.width), int(m.height)))
+	startCropX := trans.pCenterX - int(m.width)/2
+	startCropY := trans.pCenterY - int(m.height)/2
+
+	if !bounds.IsEmpty() && int(leftX-left) < startCropX {
+		m.result.XOffset = startCropX - int(leftX-left)
+		startCropX -= m.result.XOffset
+	}
+	if !bounds.IsEmpty() && int(topY-top) < startCropY {
+		m.result.YOffset = startCropY - int(topY-top)
+		startCropY -= m.result.YOffset
+	}
+
 	draw.Draw(croppedImg, image.Rect(0, 0, int(m.width), int(m.height)),
-		img, image.Point{trans.pCenterX - int(m.width)/2, trans.pCenterY - int(m.height)/2},
+		img, image.Point{startCropX, startCropY},
 		draw.Src)
 
 	// draw attribution
@@ -476,6 +515,36 @@ func (m *Context) Render() (image.Image, error) {
 	return croppedImg, nil
 }
 
+func (m *Context) getBoundaryMargins() (float64, float64, float64, float64) {
+	var top, right, bottom, left float64
+	bounds := m.determineBounds()
+	epsilon := 1e-6
+
+	for _, object := range m.objects {
+		isSameTopPoint := math.Abs(object.Bounds().Hi().Lat.Degrees()-bounds.Hi().Lat.Degrees()) < epsilon
+		isSameRightPoint := math.Abs(object.Bounds().Hi().Lng.Degrees()-bounds.Hi().Lng.Degrees()) < epsilon
+		isSameBottomPoint := math.Abs(object.Bounds().Lo().Lat.Degrees()-bounds.Lo().Lat.Degrees()) < epsilon
+		isSameLeftPoint := math.Abs(object.Bounds().Lo().Lng.Degrees()-bounds.Lo().Lng.Degrees()) < epsilon
+
+		marginLeft, marginTop, marginRight, marginBottom := object.ExtraMarginPixels()
+
+		if isSameTopPoint && marginTop > top {
+			top = marginTop
+		}
+		if isSameRightPoint && marginRight > right {
+			right = marginRight
+		}
+		if isSameBottomPoint && marginBottom > bottom {
+			bottom = marginBottom
+		}
+		if isSameLeftPoint && marginLeft > left {
+			left = marginLeft
+		}
+	}
+
+	return left, top, right, bottom
+}
+
 // RenderWithTransformer actually renders the map image including all map objects (markers, paths, areas).
 // The returned image covers requested area as well as any tiles necessary to cover that area, which may
 // be larger than the request.
@@ -483,8 +552,18 @@ func (m *Context) Render() (image.Image, error) {
 // A Transformer is returned to support image registration with other data.
 func (m *Context) RenderWithTransformer() (image.Image, *Transformer, error) {
 	zoom, center, err := m.determineZoomCenter()
+
 	if err != nil {
 		return nil, nil, err
+	}
+
+	return m.renderWithZoomAndCenterAndTransformer(zoom, center)
+}
+
+func (m *Context) renderWithZoomAndCenterAndTransformer(zoom int, center s2.LatLng) (image.Image, *Transformer, error) {
+	m.result = RenderResult{
+		Zoom:   zoom,
+		Center: center,
 	}
 
 	tileSize := m.tileProvider.TileSize
@@ -493,6 +572,16 @@ func (m *Context) RenderWithTransformer() (image.Image, *Transformer, error) {
 	gc := gg.NewContextForRGBA(img)
 	if m.background != nil {
 		draw.Draw(img, img.Bounds(), &image.Uniform{m.background}, image.Point{}, draw.Src)
+	}
+
+	bounds := m.determineBounds()
+	leftX, _ := trans.LatLngToXY(bounds.Lo())
+
+	for _, object := range m.objects {
+		_, _, _, left := object.ExtraMarginPixels()
+		if leftX-left < 0 && zoom > 0 {
+			return m.renderWithZoomAndCenterAndTransformer(zoom-1, center)
+		}
 	}
 
 	// fetch and draw tiles to img
@@ -575,4 +664,8 @@ func (m *Context) renderLayer(gc *gg.Context, zoom int, trans *Transformer, tile
 	}
 
 	return nil
+}
+
+func (m *Context) RenderResult() RenderResult {
+	return m.result
 }
